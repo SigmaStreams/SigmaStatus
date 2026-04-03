@@ -356,8 +356,7 @@ class PlexLiveboardCog(commands.Cog):
         embed = discord.Embed(
             title="🖥️ Plex Liveboard",
             description=(
-                "This board updates automatically from Plex webhook logs and direct URL health checks.\n"
-                "A server is marked down when the probe gets a real 404, a literal 200/404 page, or the host cannot be reached.\n\n"
+                "This board updates automatically to reflect current Plex server status.\n\n"
                 "If your assigned server is shown as up when it is actually down, use the button below to report it.\n\n"
                 f"Last refreshed: {_ts(_utcnow())}"
             ),
