@@ -5,14 +5,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from bot.modals import _get_ping_ids_for_report, build_staff_ping
-
 try:
     import aiohttp
 except Exception:
     aiohttp = None  # type: ignore
 
 
+OWNER_ID = 1229271933736976395
 PLEX_LOGS_CHANNEL_ID = 1475676107960356977
 PLEX_404_BODY = "404 page not found"
 
@@ -123,6 +122,10 @@ def _parse_state_from_message(content: str) -> str | None:
 
 def _normalize_probe_body(text: str) -> str:
     return " ".join((text or "").strip().lower().split())
+
+
+def _build_staff_ping(ping_ids: list[int]) -> str:
+    return " ".join(f"<@{user_id}>" for user_id in ping_ids)
 
 
 class PlexServerChoice(app_commands.Choice[str]):
@@ -590,7 +593,7 @@ class PlexLiveboardCog(commands.Cog):
 
             ping_text = ""
             if self.db.get_report_pings_enabled():
-                ping_text = build_staff_ping(_get_ping_ids_for_report(self.cfg, "vod"))
+                ping_text = _build_staff_ping(list(getattr(self.cfg, "staff_ping_user_ids", []) or []))
 
             staff_message = await staff_channel.send(
                 content=ping_text,
@@ -797,6 +800,47 @@ class PlexLiveboardCog(commands.Cog):
 
         self.db.clear_plex_liveboard(interaction.guild.id)
         await interaction.response.send_message("✅ Plex liveboard stopped.", ephemeral=True)
+
+    @app_commands.command(
+        name="reportpings",
+        description="Toggle staff pings for Plex down reports (owner only).",
+    )
+    async def reportpings(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            return await interaction.response.send_message("❌ Not allowed.", ephemeral=True)
+
+        enabled = self.db.toggle_report_pings()
+        state = "ON 🔔" if enabled else "OFF 🔕"
+        await interaction.response.send_message(
+            f"Staff pings for Plex down reports are now: **{state}**",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="synccommands",
+        description="Force re-sync slash commands for this server (owner only).",
+    )
+    async def synccommands(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            return await interaction.response.send_message("❌ Not allowed.", ephemeral=True)
+
+        if not interaction.guild:
+            return await interaction.response.send_message(
+                "This must be used in a server.",
+                ephemeral=True,
+            )
+
+        guild = discord.Object(id=interaction.guild.id)
+
+        await interaction.response.send_message("Syncing…", ephemeral=True)
+
+        self.bot.tree.copy_global_to(guild=guild)
+        synced = await self.bot.tree.sync(guild=guild)
+
+        await interaction.followup.send(
+            f"✅ Synced **{len(synced)}** commands.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="plexset",
