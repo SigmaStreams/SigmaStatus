@@ -12,7 +12,7 @@ A Discord bot focused on Plex server status tracking, staff notifications, and a
 
 ### Admin Commands
 - `/reportpings` toggles staff pings for Plex down reports
-- `/polling` opens an owner-only control panel for enabling or disabling direct URL polling per Plex server
+- `/polling` opens a staff-only control panel for enabling or disabling direct URL polling per Plex server
 - `/synccommands` forces a slash-command sync for the current server
 
 ### Reliability

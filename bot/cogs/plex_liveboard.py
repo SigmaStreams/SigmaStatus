@@ -956,10 +956,13 @@ class PlexLiveboardCog(commands.Cog):
 
     @app_commands.command(
         name="polling",
-        description="Show and toggle Plex URL polling per server (owner only).",
+        description="Show and toggle Plex URL polling per server (staff only).",
     )
     async def polling(self, interaction: discord.Interaction):
-        if interaction.user.id != OWNER_ID:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+
+        if not _is_staff(interaction.user, self.cfg.staff_role_id):
             return await interaction.response.send_message("❌ Not allowed.", ephemeral=True)
 
         await interaction.response.send_message(
