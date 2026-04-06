@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -14,6 +15,7 @@ except Exception:
 OWNER_ID = 1229271933736976395
 PLEX_LOGS_CHANNEL_ID = 1475676107960356977
 PLEX_404_BODY = "404 page not found"
+PLEX_IDENTITY_BODY_ANCHOR = "<mediacontainer"
 
 SERVER_ROLE_IDS = {
     "OMEGA": 1466939252024541423,
@@ -124,6 +126,15 @@ def _parse_state_from_message(content: str) -> str | None:
 
 def _normalize_probe_body(text: str) -> str:
     return " ".join((text or "").strip().lower().split())
+
+
+def _is_identity_probe_url(url: str) -> bool:
+    path = (urlparse(url).path or "").rstrip("/").lower()
+    return path.endswith("/identity")
+
+
+def _has_plex_identity_anchor(text: str) -> bool:
+    return PLEX_IDENTITY_BODY_ANCHOR in (text or "").lower()
 
 
 def _build_staff_ping(ping_ids: list[int]) -> str:
@@ -365,6 +376,9 @@ class PlexLiveboardCog(commands.Cog):
                     body = await resp.text(errors="ignore")
                     if _normalize_probe_body(body) == PLEX_404_BODY:
                         return "Down"
+
+                    if _is_identity_probe_url(url):
+                        return "Up" if _has_plex_identity_anchor(body) else "Down"
 
                 return "Up"
         except (asyncio.TimeoutError, aiohttp.ClientError):

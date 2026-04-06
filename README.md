@@ -37,6 +37,7 @@ PLEX_PROBE_INTERVAL_MINUTES=5
 Rules used by the poller:
 - If the response status is `404`, the server is marked `Down`
 - If the response is `200` but the trimmed/lowercased body is exactly `404 page not found`, the server is marked `Down`
+- If the configured probe URL ends with `/identity`, a `200` response must also contain `MediaContainer` or it is marked `Down`
 - If the host times out or cannot be reached, the server is marked `Down`
 - Any other successful response is treated as `Up`
 
