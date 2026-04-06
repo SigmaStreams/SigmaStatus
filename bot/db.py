@@ -7,6 +7,10 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _plex_polling_setting_key(server_name: str) -> str:
+    return f"plex_polling_enabled_{str(server_name).upper()}"
+
+
 class ReportDB:
     def __init__(self, path: str):
         self.path = path
@@ -109,6 +113,22 @@ class ReportDB:
         new_val = "0" if enabled else "1"
         self._set_setting("report_pings_enabled", new_val)
         return new_val == "1"
+
+    # ---------------- Plex polling ----------------
+
+    def get_plex_polling_enabled(self, server_name: str, default_enabled: bool = True) -> bool:
+        value = self._get_setting(_plex_polling_setting_key(server_name))
+        if value is None:
+            return bool(default_enabled)
+        return value != "0"
+
+    def set_plex_polling_enabled(self, server_name: str, enabled: bool) -> bool:
+        self._set_setting(_plex_polling_setting_key(server_name), "1" if enabled else "0")
+        return bool(enabled)
+
+    def toggle_plex_polling_enabled(self, server_name: str, default_enabled: bool = True) -> bool:
+        enabled = self.get_plex_polling_enabled(server_name, default_enabled=default_enabled)
+        return self.set_plex_polling_enabled(server_name, not enabled)
 
     # ---------------- Plex liveboard ----------------
 

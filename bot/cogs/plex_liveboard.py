@@ -33,6 +33,8 @@ SERVER_DISPLAY_NAMES = {
     "DELTA": "Delta",
 }
 
+SERVER_ORDER = ("OMEGA", "ALPHA", "DELTA")
+
 DEFAULT_STATUS = {
     "OMEGA": "Unknown",
     "ALPHA": "Unknown",
@@ -243,6 +245,63 @@ class PlexDownReportClearModal(discord.ui.Modal):
         await self.cog.finish_clear_down_report(interaction, self.message_id, self.server_name)
 
 
+class PlexPollingToggleButton(discord.ui.Button):
+    def __init__(self, cog: "PlexLiveboardCog", server_name: str, enabled: bool, configured: bool):
+        status_text = "Enabled" if enabled else "Disabled"
+        style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger
+        if not configured:
+            status_text = "Unavailable"
+            style = discord.ButtonStyle.secondary
+
+        super().__init__(
+            label=f"{_display_server_name(server_name)}: {status_text}",
+            style=style,
+            custom_id=f"plexpolling:{server_name}",
+            disabled=not configured,
+        )
+        self.cog = cog
+        self.server_name = server_name
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view if isinstance(self.view, PlexPollingView) else None
+        await self.cog.toggle_polling_server(interaction, self.server_name, view)
+
+
+class PlexPollingCloseButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=None)
+
+
+class PlexPollingView(discord.ui.View):
+    def __init__(self, cog: "PlexLiveboardCog", owner_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_id = int(owner_id)
+        self.refresh_items()
+
+    def refresh_items(self):
+        self.clear_items()
+        for item in self.cog.get_polling_state_rows():
+            self.add_item(
+                PlexPollingToggleButton(
+                    self.cog,
+                    str(item["server_name"]),
+                    bool(item["enabled"]),
+                    bool(item["configured"]),
+                )
+            )
+        self.add_item(PlexPollingCloseButton())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ This polling control panel isn’t for you.", ephemeral=True)
+            return False
+        return True
+
+
 class PlexLiveboardCog(commands.Cog):
     def __init__(self, bot, db, cfg):
         self.bot = bot
@@ -259,13 +318,39 @@ class PlexLiveboardCog(commands.Cog):
         self.plex_liveboard_loop.cancel()
         self.plex_probe_loop.cancel()
 
-    def get_probe_targets(self) -> dict[str, str]:
+    def get_configured_probe_targets(self) -> dict[str, str]:
         targets = {
             "OMEGA": self.cfg.plex_omega_url,
             "ALPHA": self.cfg.plex_alpha_url,
             "DELTA": self.cfg.plex_delta_url,
         }
         return {server_name: url for server_name, url in targets.items() if url}
+
+    def get_polling_state_rows(self) -> list[dict[str, object]]:
+        configured_targets = self.get_configured_probe_targets()
+        rows: list[dict[str, object]] = []
+
+        for server_name in SERVER_ORDER:
+            configured = bool(configured_targets.get(server_name))
+            enabled = configured and self.db.get_plex_polling_enabled(server_name, default_enabled=True)
+            rows.append(
+                {
+                    "server_name": server_name,
+                    "display_name": _display_server_name(server_name),
+                    "configured": configured,
+                    "enabled": enabled,
+                }
+            )
+
+        return rows
+
+    def get_probe_targets(self) -> dict[str, str]:
+        configured_targets = self.get_configured_probe_targets()
+        return {
+            server_name: url
+            for server_name, url in configured_targets.items()
+            if self.db.get_plex_polling_enabled(server_name, default_enabled=True)
+        }
 
     async def probe_server(self, session, url: str) -> str:
         if aiohttp is None:
@@ -373,6 +458,34 @@ class PlexLiveboardCog(commands.Cog):
         embed.add_field(name="Alpha", value=fmt(statuses.get("ALPHA", "Unknown")), inline=True)
         embed.add_field(name="Delta", value=fmt(statuses.get("DELTA", "Unknown")), inline=True)
 
+        return embed
+
+    def build_polling_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="Plex Polling Control",
+            description=(
+                "Enable or disable direct URL polling per Plex server without changing `.env`.\n\n"
+                "Disabled servers keep their configured URL, but the poller ignores them until re-enabled."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=_utcnow(),
+        )
+
+        for item in self.get_polling_state_rows():
+            server_name = str(item["server_name"])
+            configured = bool(item["configured"])
+            enabled = bool(item["enabled"])
+
+            if not configured:
+                value = "Polling unavailable. No URL is configured in `.env`."
+            elif enabled:
+                value = "Polling is currently **enabled**."
+            else:
+                value = "Polling is currently **disabled**."
+
+            embed.add_field(name=_display_server_name(server_name), value=value, inline=False)
+
+        embed.set_footer(text="Changes apply to the next probe cycle and affect all liveboards.")
         return embed
 
     def build_staff_report_embed(self, reporter: discord.Member, server_name: str) -> discord.Embed:
@@ -703,6 +816,32 @@ class PlexLiveboardCog(commands.Cog):
             self.db.set_plex_status(msg.guild.id, server, state, _utcnow().isoformat())
             await self.update_plex_liveboard(msg.guild.id)
 
+    async def toggle_polling_server(
+        self,
+        interaction: discord.Interaction,
+        server_name: str,
+        view: PlexPollingView | None,
+    ):
+        configured_targets = self.get_configured_probe_targets()
+        if server_name not in configured_targets:
+            if view is not None:
+                view.refresh_items()
+            return await interaction.response.edit_message(
+                embed=self.build_polling_embed(),
+                view=view,
+            )
+
+        async with self._lock:
+            self.db.toggle_plex_polling_enabled(server_name, default_enabled=True)
+
+        if view is not None:
+            view.refresh_items()
+
+        await interaction.response.edit_message(
+            embed=self.build_polling_embed(),
+            view=view,
+        )
+
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
         if msg.webhook_id is None:
@@ -812,6 +951,20 @@ class PlexLiveboardCog(commands.Cog):
         state = "ON 🔔" if enabled else "OFF 🔕"
         await interaction.response.send_message(
             f"Staff pings for Plex down reports are now: **{state}**",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="polling",
+        description="Show and toggle Plex URL polling per server (owner only).",
+    )
+    async def polling(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID:
+            return await interaction.response.send_message("❌ Not allowed.", ephemeral=True)
+
+        await interaction.response.send_message(
+            embed=self.build_polling_embed(),
+            view=PlexPollingView(self, interaction.user.id),
             ephemeral=True,
         )
 
