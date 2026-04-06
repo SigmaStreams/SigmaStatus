@@ -12,6 +12,7 @@ A Discord bot focused on Plex server status tracking, staff notifications, and a
 
 ### Admin Commands
 - `/reportpings` toggles staff pings for Plex down reports
+- `/polling` opens an owner-only control panel for enabling or disabling direct URL polling per Plex server
 - `/synccommands` forces a slash-command sync for the current server
 
 ### Reliability
@@ -40,6 +41,8 @@ Rules used by the poller:
 - Any other successful response is treated as `Up`
 
 If none of the three Plex URL values are set, webhook-only behavior remains in place. If you enable the poller, set all three URLs together.
+
+Once the URLs are configured, `/polling` lets you disable or re-enable polling for Omega, Alpha, and Delta individually without editing `.env` or restarting the bot. Disabled servers are skipped by both the scheduled probe loop and manual liveboard refreshes.
 
 Manual down reports remain sticky while the server is still unhealthy, but they no longer require staff cleanup once recovery is confirmed. If a later Plex webhook or URL health check detects that the same server is back up, the bot automatically clears the staff report and restores the liveboard status to `Up`.
 
