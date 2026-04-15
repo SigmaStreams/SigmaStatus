@@ -1,3 +1,5 @@
+import logging
+
 import discord
 from discord.ext import commands
 
@@ -5,6 +7,7 @@ from bot.config import load_config
 from bot.db import ReportDB
 
 DEFAULT_GUILD_ID_FOR_SYNC = 1457559352717086917
+logger = logging.getLogger(__name__)
 
 
 class SigmaReportsBot(commands.Bot):
@@ -21,7 +24,7 @@ class SigmaReportsBot(commands.Bot):
             try:
                 await self.load_extension(ext)
             except Exception as e:
-                print(f"⚠️  Skipping {ext}: {repr(e)}")
+                logger.exception("Skipping extension %s: %r", ext, e)
 
         # Sync to a single guild for fast iteration
         guild_id = getattr(self.cfg, "guild_id", None) or DEFAULT_GUILD_ID_FOR_SYNC
@@ -30,17 +33,21 @@ class SigmaReportsBot(commands.Bot):
             try:
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
-                print(f"Synced {len(synced)} commands to guild {guild_id}")
+                logger.info("Synced %s commands to guild %s", len(synced), guild_id)
             except Exception as e:
-                print(f"⚠️  Command sync failed: {repr(e)}")
+                logger.exception("Command sync failed for guild %s: %r", guild_id, e)
         else:
-            print("⚠️  No guild_id configured; skipping guild sync.")
+            logger.warning("No guild_id configured; skipping guild sync.")
 
     async def on_ready(self):
-        print(f"Logged in as {self.user} (ID: {self.user.id})")
+        logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     bot = SigmaReportsBot()
     bot.run(bot.cfg.token)
 

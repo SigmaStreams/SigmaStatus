@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import os
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -42,6 +45,11 @@ DEFAULT_STATUS = {
     "ALPHA": "Unknown",
     "DELTA": "Unknown",
 }
+LIVEBOARD_LOOP_INTERVAL_SECONDS = 3 * 60
+WATCHDOG_CHECK_INTERVAL_SECONDS = 60
+WATCHDOG_MIN_STALE_SECONDS = 10 * 60
+
+logger = logging.getLogger(__name__)
 
 
 def _is_staff(member: discord.Member, staff_role_id: int) -> bool:
@@ -319,15 +327,48 @@ class PlexLiveboardCog(commands.Cog):
         self.db = db
         self.cfg = cfg
         self._lock = asyncio.Lock()
+        now = time.monotonic()
+        self._loop_heartbeats = {
+            "liveboard": now,
+            "probe": now,
+        }
         self.liveboard_view = PlexLiveboardReportView(self)
         self.clear_report_view = PlexDownReportClearView(self)
         self.plex_liveboard_loop.start()
         self.plex_probe_loop.change_interval(minutes=self.cfg.plex_probe_interval_minutes)
         self.plex_probe_loop.start()
+        self.watchdog_loop.start()
 
     def cog_unload(self):
         self.plex_liveboard_loop.cancel()
         self.plex_probe_loop.cancel()
+        self.watchdog_loop.cancel()
+
+    def _mark_loop_heartbeat(self, loop_name: str):
+        self._loop_heartbeats[loop_name] = time.monotonic()
+
+    def _get_watchdog_targets(self) -> list[tuple[str, float, int]]:
+        targets = [
+            ("liveboard", self._loop_heartbeats["liveboard"], max(WATCHDOG_MIN_STALE_SECONDS, LIVEBOARD_LOOP_INTERVAL_SECONDS * 3)),
+        ]
+
+        if aiohttp is not None and self.get_probe_targets():
+            probe_interval_seconds = max(1, int(self.cfg.plex_probe_interval_minutes)) * 60
+            targets.append(
+                ("probe", self._loop_heartbeats["probe"], max(WATCHDOG_MIN_STALE_SECONDS, probe_interval_seconds * 3))
+            )
+
+        return targets
+
+    def _terminate_for_watchdog(self, loop_name: str, age_seconds: float, stale_after_seconds: int):
+        logger.critical(
+            "Watchdog detected stalled %s loop: no successful heartbeat for %.1f seconds (threshold=%s)",
+            loop_name,
+            age_seconds,
+            stale_after_seconds,
+        )
+        logging.shutdown()
+        os._exit(1)
 
     def get_configured_probe_targets(self) -> dict[str, str]:
         targets = {
@@ -381,7 +422,8 @@ class PlexLiveboardCog(commands.Cog):
                         return "Up" if _has_plex_identity_anchor(body) else "Down"
 
                 return "Up"
-        except (asyncio.TimeoutError, aiohttp.ClientError):
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            logger.warning("Probe request failed for %s: %s", url, exc)
             return "Down"
 
     async def collect_probe_statuses(self) -> dict[str, str]:
@@ -394,7 +436,11 @@ class PlexLiveboardCog(commands.Cog):
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for server_name, url in probe_targets.items():
-                statuses[server_name] = await self.probe_server(session, url)
+                try:
+                    statuses[server_name] = await self.probe_server(session, url)
+                except Exception:
+                    logger.exception("Unexpected error while probing %s at %s", server_name, url)
+                    statuses[server_name] = "Unknown"
 
         return statuses
 
@@ -405,19 +451,37 @@ class PlexLiveboardCog(commands.Cog):
         updated_at = _utcnow().isoformat()
 
         for guild_id in guild_ids:
-            wrote_status = False
-            for server_name, status in probe_statuses.items():
-                if self.db.has_plex_manual_override(guild_id, server_name):
-                    if status == "Up":
-                        await self.auto_clear_down_report(guild_id, server_name, "URL health check")
-                        wrote_status = True
-                    continue
+            try:
+                wrote_status = False
+                for server_name, status in probe_statuses.items():
+                    previous_status = (await self.get_current_statuses(guild_id)).get(server_name, "Unknown")
+                    if self.db.has_plex_manual_override(guild_id, server_name):
+                        if status == "Up":
+                            logger.info(
+                                "Probe recovered %s for guild %s; clearing manual override",
+                                server_name,
+                                guild_id,
+                            )
+                            await self.auto_clear_down_report(guild_id, server_name, "URL health check")
+                            wrote_status = True
+                        continue
 
-                self.db.set_plex_status(guild_id, server_name, status, updated_at)
-                wrote_status = True
+                    self.db.set_plex_status(guild_id, server_name, status, updated_at)
+                    wrote_status = True
 
-            if wrote_status:
-                await self.update_plex_liveboard(guild_id)
+                    if previous_status != status:
+                        logger.info(
+                            "Probe status changed for guild %s server %s: %s -> %s",
+                            guild_id,
+                            server_name,
+                            previous_status,
+                            status,
+                        )
+
+                if wrote_status:
+                    await self.update_plex_liveboard(guild_id)
+            except Exception:
+                logger.exception("Failed to apply probe statuses for guild %s", guild_id)
 
     async def auto_clear_down_report(self, guild_id: int, server_name: str, source_name: str):
         override = self.db.get_plex_manual_override(guild_id, server_name)
@@ -442,6 +506,12 @@ class PlexLiveboardCog(commands.Cog):
         try:
             message = await staff_channel.fetch_message(int(staff_message_id))
         except (discord.NotFound, discord.Forbidden):
+            logger.warning(
+                "Could not fetch staff report message %s while auto-clearing %s for guild %s",
+                staff_message_id,
+                server_name,
+                guild_id,
+            )
             return
 
         embed = message.embeds[0] if message.embeds else None
@@ -630,9 +700,10 @@ class PlexLiveboardCog(commands.Cog):
             msg = await channel.fetch_message(int(settings["message_id"]))
             await msg.edit(embed=embed, view=self.liveboard_view)
         except discord.NotFound:
+            logger.warning("Liveboard message %s no longer exists for guild %s", settings["message_id"], guild_id)
             self.db.clear_plex_liveboard(guild_id)
         except discord.Forbidden:
-            pass
+            logger.warning("Missing permission to update liveboard for guild %s", guild_id)
 
     async def handle_liveboard_report_button(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -734,6 +805,11 @@ class PlexLiveboardCog(commands.Cog):
                     staff_message_id=staff_message.id,
                 )
         except Exception:
+            logger.exception(
+                "Failed to create down report for guild %s server %s",
+                interaction.guild.id,
+                server_name,
+            )
             async with self._lock:
                 self.db.set_plex_manual_override(interaction.guild.id, server_name, False)
                 self.db.set_plex_status(interaction.guild.id, server_name, "Up", _utcnow().isoformat())
@@ -820,15 +896,31 @@ class PlexLiveboardCog(commands.Cog):
         if not server or not state:
             return
 
+        previous_status = (await self.get_current_statuses(msg.guild.id)).get(server, "Unknown")
+
         async with self._lock:
             if self.db.has_plex_manual_override(msg.guild.id, server):
                 if state == "Up":
+                    logger.info(
+                        "Webhook recovered %s for guild %s; clearing manual override",
+                        server,
+                        msg.guild.id,
+                    )
                     await self.auto_clear_down_report(msg.guild.id, server, "Plex webhook")
                     await self.update_plex_liveboard(msg.guild.id)
                 return
 
             self.db.set_plex_status(msg.guild.id, server, state, _utcnow().isoformat())
             await self.update_plex_liveboard(msg.guild.id)
+
+        if previous_status != state:
+            logger.info(
+                "Webhook status changed for guild %s server %s: %s -> %s",
+                msg.guild.id,
+                server,
+                previous_status,
+                state,
+            )
 
     async def toggle_polling_server(
         self,
@@ -864,7 +956,7 @@ class PlexLiveboardCog(commands.Cog):
         try:
             await self.handle_plex_log_message(msg)
         except Exception:
-            pass
+            logger.exception("Failed to process Plex webhook message %s", msg.id)
 
     @tasks.loop(minutes=3)
     async def plex_liveboard_loop(self):
@@ -873,7 +965,14 @@ class PlexLiveboardCog(commands.Cog):
                 try:
                     await self.update_plex_liveboard(int(s["guild_id"]))
                 except Exception:
+                    logger.exception("Liveboard refresh loop failed for guild %s", s["guild_id"])
                     continue
+
+        self._mark_loop_heartbeat("liveboard")
+
+    @plex_liveboard_loop.error
+    async def plex_liveboard_loop_error(self, error: Exception):
+        logger.exception("Liveboard loop crashed: %s", error)
 
     @plex_liveboard_loop.before_loop
     async def before_loop(self):
@@ -881,16 +980,44 @@ class PlexLiveboardCog(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def plex_probe_loop(self):
-        probe_statuses = await self.collect_probe_statuses()
-        if not probe_statuses:
-            return
+        try:
+            probe_statuses = await self.collect_probe_statuses()
+            if not probe_statuses:
+                self._mark_loop_heartbeat("probe")
+                return
 
-        guild_ids = [int(settings["guild_id"]) for settings in self.db.list_plex_liveboards()]
-        if not guild_ids:
-            return
+            guild_ids = [int(settings["guild_id"]) for settings in self.db.list_plex_liveboards()]
+            if not guild_ids:
+                self._mark_loop_heartbeat("probe")
+                return
 
-        async with self._lock:
-            await self.apply_probe_statuses(guild_ids, probe_statuses)
+            async with self._lock:
+                await self.apply_probe_statuses(guild_ids, probe_statuses)
+
+            self._mark_loop_heartbeat("probe")
+        except Exception:
+            logger.exception("Probe loop iteration failed")
+
+    @plex_probe_loop.error
+    async def plex_probe_loop_error(self, error: Exception):
+        logger.exception("Probe loop crashed: %s", error)
+
+    @tasks.loop(seconds=WATCHDOG_CHECK_INTERVAL_SECONDS)
+    async def watchdog_loop(self):
+        now = time.monotonic()
+
+        for loop_name, last_seen, stale_after_seconds in self._get_watchdog_targets():
+            age_seconds = now - last_seen
+            if age_seconds > stale_after_seconds:
+                self._terminate_for_watchdog(loop_name, age_seconds, stale_after_seconds)
+
+    @watchdog_loop.before_loop
+    async def before_watchdog_loop(self):
+        await self.bot.wait_until_ready()
+
+    @watchdog_loop.error
+    async def watchdog_loop_error(self, error: Exception):
+        logger.exception("Watchdog loop crashed: %s", error)
 
     @plex_probe_loop.before_loop
     async def before_probe_loop(self):
