@@ -19,6 +19,7 @@ A Discord bot focused on Plex server status tracking, staff notifications, and a
 - Persistent Discord views so buttons keep working across bot restarts
 - Dockerized deployment for straightforward hosting
 - SQLite persistence for Plex statuses, liveboards, and manual override state
+- A watchdog loop exits the process if the liveboard or probe background tasks stop advancing, letting Docker restart the bot automatically
 
 ## Plex URL health checks
 
